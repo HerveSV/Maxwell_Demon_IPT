@@ -131,8 +131,8 @@ video_names = [
     "1.5g@38Hz.mov",
     "1.5g@40Hz.mov",
 ]'''
-video_dir = "videos/13-11/1.75g_cropped"
-save_dir = "data/13-11/1.75g"
+video_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/13-11-25/1.75g"
+save_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/data/13-11/1.75g"
 
 mm_per_px = 350. / (1000-40) # mm / px, quite rough
 fps = 60.
