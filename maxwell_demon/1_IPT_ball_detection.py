@@ -15,7 +15,20 @@ MAX_DIST = 14  # maximum allowed displacement per frame (tune this)
 VERBOSE = True
 PLOT = False
 
+'''
+centroid {tuple}
+(x, y, contour_area)
+'''
+
+'''
+all_centroids {list{centroid}}
+'''
+
 def detect_centroids(frame_gray):
+    '''
+    frame_gray: grayscale image frame
+    Returns list of tuples, each representing a particle (x, y, contour_area)
+    '''
     # threshold bright balls
     _, bw = cv2.threshold(frame_gray, THRESH, 255, cv2.THRESH_BINARY)
     bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
@@ -34,7 +47,7 @@ def detect_centroids(frame_gray):
         if M["m00"] > 0:
             cx = M["m10"] / M["m00"]
             cy = M["m01"] / M["m00"]
-            centroids.append((float(cx), float(cy)))
+            centroids.append((float(cx), float(cy), cv2.contourArea(c)))
 
     return centroids
 
@@ -42,7 +55,7 @@ def match_points(prev_pts, curr_pts):
     """
     prev_pts: list of (x, y) from frame i
     curr_pts: list of (x, y) from frame i+1
-    Returns list of (prev_index, curr_index) matches.
+    Returns list of (prev_index, curr_index) matches. i.e. it matches the same particle between frame i and i+1
     """
 
     if len(prev_pts) == 0 or len(curr_pts) == 0:
@@ -63,6 +76,137 @@ def match_points(prev_pts, curr_pts):
             used_curr.add(j)
 
     return matches
+
+def build_clean_dataset(all_centroids, fps, mm_per_px):
+    """
+    all_centroids: list of lists
+        all_centroids[f] = [(x, y, area), ...] for frame f
+    fps: frames per second
+
+    Returns:
+        pandas DataFrame with columns:
+        frame, particle_id, x, y, area, vx, vy, speed
+    """
+
+    # This will store every record
+    rows = []
+
+    # Particle tracks: particle_id -> last known (x, y)
+    particle_last_pos = {}
+    next_particle_id = 0
+
+    # Particle assignment per frame: list of dicts
+    # frame_assignments[f][j] = particle_id
+    frame_assignments = []
+
+    # ---- PASS 1: assign particle IDs for every frame ----
+    for f in range(len(all_centroids)):
+        curr_pts = all_centroids[f]
+        curr_positions = [(p[0], p[1]) for p in curr_pts]
+
+        frame_map = {}  # maps centroid index j → particle ID
+
+        if f == 0:
+            # First frame → every blob is new
+            for j, p in enumerate(curr_positions):
+                frame_map[j] = next_particle_id
+                particle_last_pos[next_particle_id] = p
+                next_particle_id += 1
+        else:
+            prev_pts = all_centroids[f - 1]
+            prev_positions = [(p[0], p[1]) for p in prev_pts]
+
+            matches = match_points(prev_positions, curr_positions)
+
+            used_curr = set() # list of particle indices which have already been matched
+
+            # Assign matched particles
+            for (i, j) in matches:
+                pid = frame_assignments[-1][i]   # same particle ID as in previous frame
+                frame_map[j] = pid
+                particle_last_pos[pid] = curr_positions[j]
+                used_curr.add(j)
+
+            # Unmatched = new particles
+            for j, p in enumerate(curr_positions):
+                if j not in used_curr:
+                    frame_map[j] = next_particle_id
+                    particle_last_pos[next_particle_id] = p
+                    next_particle_id += 1
+
+        frame_assignments.append(frame_map)
+
+    # ---- PASS 2: compute vx, vy, speed ----
+    for f in range(len(all_centroids)):
+        for j, (x, y, area) in enumerate(all_centroids[f]):
+            pid = frame_assignments[f][j]
+
+            # Velocity = difference with previous frame
+            if f == 0 or pid not in frame_assignments[f-1].values():
+                vx = np.nan
+                vy = np.nan
+            else:
+                # Find previous index of same particle
+                prev_map = frame_assignments[f - 1]
+                prev_idx = None
+                for k, p_pid in prev_map.items():
+                    if p_pid == pid:
+                        prev_idx = k
+                        break
+
+                if prev_idx is None:
+                    vx = vy = np.nan
+                else:
+                    x_prev, y_prev, _ = all_centroids[f - 1][prev_idx]
+                    vx = (x - x_prev)
+                    vy = (y - y_prev)
+
+            speed = np.sqrt(vx * vx + vy * vy) if not np.isnan(vx) else np.nan
+
+            rows.append({
+                "frame": f,
+                "particle_id": pid,
+                "area": area,
+                "x_px": x,
+                "y_px": y,
+                "x_mm": x*mm_per_px,
+                "y_mm": y*mm_per_px,
+                "vx_px/frame": vx,
+                "vy_px/frame": vy,
+                "speed_px/frame": speed,
+                "vx_mm/s": vx*mm_per_px*fps,
+                "vy_mm/s": vy*mm_per_px*fps,
+                "speed_mm/s": speed*mm_per_px*fps
+            })
+    
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+def compute_rich_data(all_centroids):
+    data_dict = {
+        "frame": [],
+        "x": [],
+        "y": [],
+        "area": [],
+        "particle": [],
+        "vx": [],
+        "vy": [],
+        "speed": []
+    }
+
+    for f in range(len(all_centroids)-1): # can't compute velocities for the last frame. Not a big loss
+        # frame f
+        prev_pts = all_centroids[f]
+        curr_pts = all_centroids[f+1]
+
+        matches = match_points(prev_pts, curr_pts)
+
+        for (i, j) in matches: # anything which has not been matched
+            continue
+
+    return
 
 def compute_velocities(centroids):
     vx = []
@@ -131,24 +275,28 @@ video_names = [
     "1.5g@38Hz.mov",
     "1.5g@40Hz.mov",
 ]'''
-video_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/13-11-25/1.75g"
+video_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/13-11-25/1.75g/cropped"
 save_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/data/13-11/1.75g"
+
 
 mm_per_px = 350. / (1000-40) # mm / px, quite rough
 fps = 60.
+#fps = cap.get(cv2.CAP_PROP_FPS)
 
 
 # --------- MAIN LOOP: store coordinates --------
 
 
+
 for i in range(len(video_names)):
+    if i > 0: break
     video_path = os.path.join(video_dir, video_names[i])
     print(f"Current video {video_path}")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError("Could not open video file.")
 
-    all_centroids = []   # list of lists
+    all_centroids = []   # list of list of centroids. Each element represents a frame
 
     frame_idx = 0
     while True:
@@ -169,54 +317,121 @@ for i in range(len(video_names)):
     #print("Example entry (frame 0):", all_centroids[0])
 
 
+    # -------- COMPUTE DATASET -----------
 
-    # -------- COMPUTE VELOCITIES --------
-    
-    vx_all, vy_all = compute_velocities(all_centroids)
-    vx_t, vy_t = vx_all*fps, vy_all*fps
-
-
-    if PLOT:
-        plt.figure(figsize=(8,5))
-        plt.hist(vx_t, bins=150)
-
-        plt.title("Distribution of x-direction velocities")
-        plt.xlabel("vx (pixels per second)")
-        plt.ylabel("Count")
-
-
-        plt.grid(True)
-        plt.show()
-
-
-        plt.figure(figsize=(8,5))
-        plt.hist(vy_t, bins=150)
-
-        plt.title("Distribution of x-direction velocities")
-        plt.xlabel("vy (pixels per second)")
-        plt.ylabel("Count")
-
-
-        plt.grid(True)
-        plt.show()
-
-
+    print("Building dataset")
+    df = build_clean_dataset(all_centroids, fps, mm_per_px)
+    print("Dataset built dataset")
 
     # --------- SAVE FILE ----------------
 
     save_name = os.path.splitext(os.path.basename(video_path))[0]
     save_path = os.path.join(save_dir, save_name+".csv")
-    data = {
-        "vx_px": vx_t, # in pixels
-        "vy_px": vy_t,
-        "vx": vx_t*mm_per_px,
-        "vy": vy_t*mm_per_px
-    }
-    df = pd.DataFrame(data)
 
     #print(df)
     df.to_csv(save_path)
     print(f"File saved at {save_path}")
+
+
+
+    # -------- BUILD VIDEO TRACKING PARTICLE -------
+
+    print("Drawing video")
+    output_path = "videos/particle_tracking.mp4"
+    if True:
+        # =====================================================
+        # =============== LOOP 2: DRAW + SAVE =================
+        # =====================================================
+
+        cap = cv2.VideoCapture(video_path)
+
+        # Output video writer setup
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"{fps = }")
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # get data for frame
+            frame_data = df.loc[df['frame']==frame_idx]
+
+            # draw circle which pid label on each particle
+            for row_i in range(len(frame_data)):
+                row = frame_data.iloc[row_i]
+                cx, cy, pid = row['x_px'], row['y_px'], row['particle_id']
+                #print(f"{cx = }")
+                #print(f"{cy = }")
+                cv2.circle(frame, (int(cx), int(cy)), 6, (0, 0, 255), 2)
+
+                # show particle_id
+                pid_text = f"id={pid}"
+                cv2.putText(frame, pid_text, (int(cx)+5, int(cy)-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 0), 1)
+
+
+
+            
+
+            # Write to output video
+            out.write(frame)
+
+            frame_idx += 1
+
+        cap.release()
+        out.release()
+
+
+
+        print("Annotated video saved as:", output_path)
+
+
+    # -------- COMPUTE VELOCITIES --------
+    
+    if False:
+        vx_all, vy_all = compute_velocities(all_centroids)
+        vx_t, vy_t = vx_all*fps, vy_all*fps
+
+
+        if PLOT:
+            plt.figure(figsize=(8,5))
+            plt.hist(vx_t, bins=150)
+
+            plt.title("Distribution of x-direction velocities")
+            plt.xlabel("vx (pixels per second)")
+            plt.ylabel("Count")
+
+
+            plt.grid(True)
+            plt.show()
+
+
+            plt.figure(figsize=(8,5))
+            plt.hist(vy_t, bins=150)
+
+            plt.title("Distribution of x-direction velocities")
+            plt.xlabel("vy (pixels per second)")
+            plt.ylabel("Count")
+
+
+            plt.grid(True)
+            plt.show()
+
+
+
+   
+
+
+
 
 
 if False:   #Show video with detections

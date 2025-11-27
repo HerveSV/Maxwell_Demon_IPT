@@ -68,7 +68,7 @@ y1, y2 = 157, 185
 
 print("Loading video")
 
-video_path = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/13-11-25/1.75g/cropped/1.75g@18Hz_detection_window.mov"
+video_path = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/13-11-25/1.75g/cropped/1.75g@15Hz.mov"
 print(f"Current video {video_path}")
 cap = cv2.VideoCapture(video_path)
 
@@ -149,6 +149,7 @@ if True:
 
     # Output video writer setup
     fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"{fps = }")
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
