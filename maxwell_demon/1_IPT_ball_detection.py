@@ -6,6 +6,8 @@ import time
 import pandas as pd
 import os
 
+from scipy.optimize import curve_fit
+
 
 THRESH = 145
 MIN_AREA = 20
@@ -14,6 +16,7 @@ MAX_DIST = 14  # maximum allowed displacement per frame (tune this)
 
 VERBOSE = True
 PLOT = False
+COMPUTE_MSD = False
 
 '''
 centroid {tuple}
@@ -183,30 +186,56 @@ def build_clean_dataset(all_centroids, fps, mm_per_px):
     df = pd.DataFrame(rows)
     return df
 
+# deprecated, slow
+def compute_MSD(df, time_conversion=1, length2_conversion=1 ,max_lag=None):
+    """
+    Computes the Mean Squared Displacement for a tracked dataset.
+    
+    df: pandas DataFrame with columns ['frame', 'pid', 'x', 'y']
+    max_lag: maximum time lag to compute (in frames). 
+             Default: full possible range.
+    
+    Returns: DataFrame with columns ['lag', 'MSD']
+    """
 
-def compute_rich_data(all_centroids):
-    data_dict = {
-        "frame": [],
-        "x": [],
-        "y": [],
-        "area": [],
-        "particle": [],
-        "vx": [],
-        "vy": [],
-        "speed": []
-    }
+    # Ensure sorted by pid then frame
+    df = df.sort_values(["pid", "frame"])
 
-    for f in range(len(all_centroids)-1): # can't compute velocities for the last frame. Not a big loss
-        # frame f
-        prev_pts = all_centroids[f]
-        curr_pts = all_centroids[f+1]
+    # Determine maximum lag
+    if max_lag is None:
+        max_lag = df["frame"].max()
 
-        matches = match_points(prev_pts, curr_pts)
+    # Store MSD values
+    msd_vals = []
 
-        for (i, j) in matches: # anything which has not been matched
-            continue
+    # Loop over lag values
+    for lag in range(1, max_lag + 1):
+        displacements = []
 
-    return
+        # For each particle
+        for pid, track in df.groupby("pid"):
+
+            frames = track["frame"].values
+            xs = track["x"].values
+            ys = track["y"].values
+
+            # For each possible displacement
+            for i in range(len(track) - lag):
+                if frames[i+lag] == frames[i] + lag:
+                    dx = xs[i+lag] - xs[i]
+                    dy = ys[i+lag] - ys[i]
+                    displacements.append(dx*dx + dy*dy)
+
+        # Average over all particles
+        if len(displacements) > 0:
+            msd_vals.append(np.mean(displacements))
+        else:
+            msd_vals.append(np.nan)
+
+    # Return results as a DataFrame
+    lags = np.arange(1, max_lag+1)*time_conversion
+    msd_vals = np.array(msd_vals)*length2_conversion
+    return lags, msd_vals
 
 def compute_velocities(centroids):
     vx = []
@@ -234,10 +263,51 @@ def compute_velocities(centroids):
     #print(vy)
     return np.array(vx), np.array(vy)#[vx, vy]
 
+def df_to_tensor(df):
+    """
+    Convert long-form tracking DataFrame into a tensor P × T × 2.
+    df must contain columns: particle_id, frame, x_px, y_px
+    Missing frames will be NaN.
+    """
+    pids = df["particle_id"].unique()
+    frames = df["frame"].unique()
 
+    P = len(pids)
+    T = len(frames)
+
+    positions = np.full((P, T, 2), np.nan, dtype=float)
+
+    pid_to_idx = {pid: i for i, pid in enumerate(pids)}
+    frame_to_idx = {frame: i for i, frame in enumerate(frames)}
+
+    for _, row in df.iterrows():
+        p = pid_to_idx[row['particle_id']]
+        t = frame_to_idx[row['frame']]
+        positions[p, t, 0] = row['x_px']
+        positions[p, t, 1] = row['y_px']
+
+    return positions
+
+def compute_msd_fast(positions):
+    """
+    positions: array of shape (P, T, 2)
+    returns: MSD for lags 1..T-1
+    """
+    P, T, _ = positions.shape
+    msd = np.zeros(T)
+
+    # For each lag τ, compute (r(t+τ) - r(t))² averaged over all pids and valid t
+    for tau in range(1, T):
+        diffs = positions[:, tau:, :] - positions[:, :-tau, :]
+        squared = np.sum(diffs**2, axis=2)
+
+        # ignore missing data (nan)
+        msd[tau] = np.nanmean(squared)
+
+    return msd
 # --------------------------------------------
 
-video_names = [
+'''video_names = [
     "1.75g@15Hz.mov",
     "1.75g@18Hz.mov",
     "1.75g@20Hz.mov",
@@ -248,8 +318,8 @@ video_names = [
     "1.75g@30Hz.mov",
     "1.75g@32Hz.mov",
     "1.75g@34Hz.mov"
-]
-'''[
+]'''
+'''video_names= [
     "1.25g@15Hz.mov",
     "1.25g@20Hz.mov",
     "1.25g@22Hz.mov",
@@ -260,7 +330,7 @@ video_names = [
     "1.25g@32Hz.mov",
     "1.25g@34Hz.mov",
 ]'''
-'''[
+'''video_names = [
     "1.5g@15Hz.mov",
     "1.5g@18Hz.mov",
     "1.5g@20Hz.mov",
@@ -275,8 +345,17 @@ video_names = [
     "1.5g@38Hz.mov",
     "1.5g@40Hz.mov",
 ]'''
-video_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/13-11-25/1.75g/cropped"
-save_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/data/13-11/1.75g"
+
+
+
+video_names = ["20balls, initially off, on at 2:.mov"]
+video_dir = '/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/Demon Operation (27.11.)/cropped'
+#video_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/videos/13-11-25/1.5g/cropped"
+
+
+save_dir = "/Users/hervesv/Documents/CloudDrive/IPT/Maxwell_Demon_2025/data/27-11/"
+
+
 
 
 mm_per_px = 350. / (1000-40) # mm / px, quite rough
@@ -289,7 +368,7 @@ fps = 60.
 
 
 for i in range(len(video_names)):
-    if i > 0: break
+    #if i > 0: break
     video_path = os.path.join(video_dir, video_names[i])
     print(f"Current video {video_path}")
     cap = cv2.VideoCapture(video_path)
@@ -316,12 +395,54 @@ for i in range(len(video_names)):
     if VERBOSE: print("Number of frames processed:", len(all_centroids))
     #print("Example entry (frame 0):", all_centroids[0])
 
-
+    
     # -------- COMPUTE DATASET -----------
 
     print("Building dataset")
     df = build_clean_dataset(all_centroids, fps, mm_per_px)
     print("Dataset built dataset")
+
+
+
+    # -------- IDENTIFY BAD PARTICLES --------------
+
+    # particles which do not move
+    '''epsilon_rms = 1.3 # px/frame
+    rms_speed = df.groupby("particle_id")["speed_px/frame"].mean()
+    bad_speed = rms_speed[rms_speed < epsilon_rms].index'''
+
+    # particles which do not appear for many frames
+    f_threshold = 10 # 10 frames minimum
+    df_pid = df.groupby("particle_id")
+
+    short_tracks = [] # keep pid of particles with frames under threshold
+    for pid, track in df_pid:
+        if len(track) < f_threshold:
+            short_tracks.append(pid)
+
+    print(f"Removed particles which appear for under {f_threshold} frames")
+
+    # particles which have low rms for n_frames consecutive frames
+    '''n_frames = 60
+    stoppers = []
+
+    for pid, track in df.groupby("particle_id"):
+        T = len(track)
+        if T < n_frames: continue
+        for i in range(T-n_frames):
+            subtrack = track[i:i+n_frames]
+            sub_rms = subtrack['speed_px/frame'].mean()
+            if sub_rms < epsilon_rms:
+                stoppers.append(pid)
+                break
+
+
+    
+    df_bad = df[df["particle_id"].isin(stoppers)]#df[(df["particle_id"].isin(bad_speed)) & (df["particle_id"].isin(short_tracks))]
+
+    print(f"Bad particles ids: {df_bad["particle_id"]}")
+    '''
+    df_good = df[~df['particle_id'].isin(short_tracks)]
 
     # --------- SAVE FILE ----------------
 
@@ -329,8 +450,73 @@ for i in range(len(video_names)):
     save_path = os.path.join(save_dir, save_name+".csv")
 
     #print(df)
-    df.to_csv(save_path)
+    df_good.to_csv(save_path)
     print(f"File saved at {save_path}")
+
+     # --------- COMPUTE MSD --------------
+    if COMPUTE_MSD :
+       
+
+        print("Computing MSD")
+
+        positions = df_to_tensor(df_good)
+        msd_px2 = compute_msd_fast(positions)
+        lag_frame = np.arange(0, len(msd_px2))
+        
+        lag_s = lag_frame/fps
+        msd_mm2 = msd_px2 * mm_per_px**2
+
+        df_msd = pd.DataFrame({"lag_frame": lag_frame,
+                            "msd_px2": msd_px2,
+                            "lag_s": lag_s,
+                            "msd_mm2": msd_mm2})
+        
+
+        # ---------- SAVE MSD DATA ------------
+
+        msd_path = os.path.join(save_dir, save_name+"_msd.csv")
+        df_msd.to_csv(msd_path)
+        print(f"MSD saved at {msd_path}")
+
+        # ---------- SAVE MSD FIGURE -----------
+
+        plt.clf()
+        
+        msd_fig_path = os.path.join(save_dir, save_name+"_msd.pdf")
+        
+        def lin_model(x, a):
+            return a*x
+
+        def quad_model(x, a):
+            return a*x**2
+        
+        lag_nonan = np.array([lag_s[i] for i in range(len(lag_s)) if not np.isnan(msd_mm2[i])])
+        msd_nonan = np.array([msd_mm2[i] for i in range(len(msd_mm2)) if not np.isnan(msd_mm2[i])])
+
+        plt.scatter(lag_s, msd_mm2, s=5)
+
+        # fit the front half of dataset
+        lag_half1 = lag_nonan[:int(len(lag_nonan)*0.005)]
+        msd_half1 = msd_nonan[:int(len(lag_nonan)*0.005)]
+        popt1, pcov1 = curve_fit(quad_model, lag_half1, msd_half1)
+
+        #print(popt1)
+        plt.plot(lag_nonan[:int(len(lag_nonan)*0.05)], quad_model(lag_nonan[:int(len(lag_nonan)*0.05)], *popt1), label=r"~$\tau^2$")
+
+        # fit the back half of dataset
+        lag_half2 = lag_nonan[int(len(lag_nonan)*0.03):int(len(lag_nonan)*0.08)]
+        msd_half2 = msd_nonan[int(len(lag_nonan)*0.03):int(len(lag_nonan)*0.08)]
+        popt2, pcov2 = curve_fit(lin_model, lag_half2, msd_half2)
+        #print(popt2)
+        plt.plot(lag_nonan[int(len(lag_nonan)*0.005):], lin_model(lag_nonan[int(len(lag_nonan)*0.005):], *popt2), label=r"~$\tau$")
+        
+        plt.legend()
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.xlabel(r"Lag time $\tau$ [s]")
+        plt.ylabel("MSD [mm$^2$]")
+        plt.title(f"MSD {save_name}")
+        plt.savefig(msd_fig_path)
 
 
 
@@ -363,6 +549,7 @@ for i in range(len(video_names)):
 
             # get data for frame
             frame_data = df.loc[df['frame']==frame_idx]
+            #frame_data = df_bad.loc[df_bad['frame']==frame_idx] # only label bad particles
 
             # draw circle which pid label on each particle
             for row_i in range(len(frame_data)):
@@ -370,7 +557,10 @@ for i in range(len(video_names)):
                 cx, cy, pid = row['x_px'], row['y_px'], row['particle_id']
                 #print(f"{cx = }")
                 #print(f"{cy = }")
-                cv2.circle(frame, (int(cx), int(cy)), 6, (0, 0, 255), 2)
+                color = (0,0,255)#(255, 0, 0) if (pid in bad_speed or pid in short_tracks) else (0, 0, 255) # change color if particle is bad
+
+                cv2.circle(frame, (int(cx), int(cy)), 6, color, 2)
+
 
                 # show particle_id
                 pid_text = f"id={pid}"
